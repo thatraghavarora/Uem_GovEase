@@ -20,17 +20,48 @@ $profile = [
 $profileFound = false;
 $profileError = '';
 
-$credentialsPath = __DIR__ . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json';
-if (is_readable($credentialsPath)) {
+$credentialsPath = resolveCredentialsPath();
+$projectId = '';
+$token = '';
+$apiKey = '';
+$authMode = 'service';
+
+if ($credentialsPath !== '') {
     try {
-        $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true, 512, JSON_THROW_ON_ERROR);
+        $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true);
         $projectId = (string) ($serviceAccount['project_id'] ?? '');
         $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
         $privateKey = (string) ($serviceAccount['private_key'] ?? '');
 
-        if ($projectId !== '' && $clientEmail !== '' && $privateKey !== '') {
+        if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
+            throw new RuntimeException('Invalid service account JSON.');
+        }
+
+        try {
             $token = getAccessToken($clientEmail, $privateKey);
-            $phoneCandidates = buildPhoneCandidates($userPhone);
+        } catch (Throwable $e) {
+            $authMode = 'api';
+        }
+    } catch (Throwable $e) {
+        $authMode = 'api';
+    }
+} else {
+    $authMode = 'api';
+}
+
+if ($authMode === 'api') {
+    $config = resolveFirebaseConfig();
+    $projectId = $config['projectId'];
+    $apiKey = $config['apiKey'];
+    if ($projectId === '' || $apiKey === '') {
+        $profileError = 'Unable to load profile details.';
+    }
+}
+
+if ($profileError === '') {
+    try {
+        $phoneCandidates = buildPhoneCandidates($userPhone);
+        if ($authMode === 'service') {
             foreach ($phoneCandidates as $candidate) {
                 if ($candidate === '') {
                     continue;
@@ -72,37 +103,35 @@ if (is_readable($credentialsPath)) {
                     break 2;
                 }
             }
+        }
 
-            if (!$profileFound) {
-                $docCandidates = $phoneCandidates !== [] ? $phoneCandidates : [$userPhone];
-                foreach ($docCandidates as $candidate) {
-                    if ($candidate === '') {
-                        continue;
-                    }
-                    $docUrl = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
-                        . '/databases/(default)/documents/kyc_submissions/' . rawurlencode($candidate);
-                    $doc = fetchDocument($docUrl, $token);
-                    if (!$doc || empty($doc['fields'])) {
-                        continue;
-                    }
-                    $fields = $doc['fields'];
-                    $profile['fullName'] = (string) ($fields['fullName']['stringValue'] ?? '');
-                    $profile['name'] = (string) ($fields['name']['stringValue'] ?? $cookieName);
-                    $profile['email'] = (string) ($fields['email']['stringValue'] ?? $cookieEmail);
-                    $profile['phone'] = (string) ($fields['phone']['stringValue'] ?? $candidate);
-                    $profileFound = true;
-                    break;
+        if (!$profileFound) {
+            $docCandidates = $phoneCandidates !== [] ? $phoneCandidates : [$userPhone];
+            foreach ($docCandidates as $candidate) {
+                if ($candidate === '') {
+                    continue;
                 }
+                $docUrl = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+                    . '/databases/(default)/documents/kyc_submissions/' . rawurlencode($candidate);
+                $doc = $authMode === 'api'
+                    ? fetchDocumentWithApiKey($docUrl, $apiKey)
+                    : fetchDocument($docUrl, $token);
+                if (!$doc || empty($doc['fields'])) {
+                    continue;
+                }
+                $fields = $doc['fields'];
+                $profile['fullName'] = (string) ($fields['fullName']['stringValue'] ?? '');
+                $profile['name'] = (string) ($fields['name']['stringValue'] ?? $cookieName);
+                $profile['email'] = (string) ($fields['email']['stringValue'] ?? $cookieEmail);
+                $profile['phone'] = (string) ($fields['phone']['stringValue'] ?? $candidate);
+                $profileFound = true;
+                break;
             }
-        } else {
-            $profileError = 'Service account JSON is missing required fields.';
         }
     } catch (Throwable $e) {
         error_log('Profile load failed: ' . $e->getMessage());
         $profileError = 'Unable to load profile details.';
     }
-} else {
-    $profileError = 'Service account JSON not readable.';
 }
 
 $displayName = $profile['fullName'] !== '' ? $profile['fullName'] : $profile['name'];
@@ -154,6 +183,81 @@ function buildInitials(string $name): string
         }
     }
     return $letters !== '' ? $letters : 'U';
+}
+
+function resolveCredentialsPath(): string
+{
+    $candidates = [
+        __DIR__ . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json',
+        dirname(__DIR__) . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json',
+        getcwd() . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            return $path;
+        }
+    }
+    return '';
+}
+
+function resolveFirebaseConfig(): array
+{
+    $candidates = [
+        __DIR__ . '/firebase.json',
+        dirname(__DIR__) . '/firebase.json',
+        getcwd() . '/firebase.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            $config = json_decode((string) file_get_contents($path), true);
+            if (is_array($config)) {
+                return [
+                    'projectId' => (string) ($config['projectId'] ?? ''),
+                    'apiKey' => (string) ($config['apiKey'] ?? ''),
+                ];
+            }
+        }
+    }
+    return ['projectId' => '', 'apiKey' => ''];
+}
+
+function appendApiKey(string $url, string $apiKey): string
+{
+    $separator = strpos($url, '?') === false ? '?' : '&';
+    return $url . $separator . 'key=' . rawurlencode($apiKey);
+}
+
+function fetchDocumentWithApiKey(string $url, string $apiKey): ?array
+{
+    $url = appendApiKey($url, $apiKey);
+    $ch = curl_init($url);
+    $options = [
+        CURLOPT_CUSTOMREQUEST => 'GET',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+        ],
+        CURLOPT_TIMEOUT => 15,
+    ];
+    curl_setopt_array($ch, $options);
+
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        throw new RuntimeException('Request failed: ' . curl_error($ch));
+    }
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($status === 404) {
+        return null;
+    }
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || $status >= 400) {
+        throw new RuntimeException('Firestore API error: ' . $raw);
+    }
+
+    return $data;
 }
 
 function fetchDocument(string $url, string $token): ?array

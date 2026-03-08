@@ -9,8 +9,41 @@ if (!empty($_SESSION['admin_user'])) {
 }
 
 $credentialsPath = resolveCredentialsPath();
+$projectId = '';
+$token = '';
+$apiKey = '';
+$authMode = 'service';
 $errorMessage = '';
 $usernameInput = '';
+
+if ($credentialsPath !== '') {
+    try {
+        $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true);
+        $projectId = (string) ($serviceAccount['project_id'] ?? '');
+        $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
+        $privateKey = (string) ($serviceAccount['private_key'] ?? '');
+
+        if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
+            throw new RuntimeException('Invalid service account JSON.');
+        }
+
+        try {
+            $token = getAccessToken($clientEmail, $privateKey);
+        } catch (Throwable $e) {
+            $authMode = 'api';
+        }
+    } catch (Throwable $e) {
+        $authMode = 'api';
+    }
+} else {
+    $authMode = 'api';
+}
+
+if ($authMode === 'api') {
+    $config = resolveFirebaseConfig();
+    $projectId = $config['projectId'];
+    $apiKey = $config['apiKey'];
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $usernameInput = trim((string) ($_POST['username'] ?? ''));
@@ -18,21 +51,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($usernameInput === '' || $passwordInput === '') {
         $errorMessage = 'Username and password are required.';
-    } elseif ($credentialsPath === '') {
-        $errorMessage = 'Service account JSON not readable.';
+    } elseif ($authMode === 'api' && ($projectId === '' || $apiKey === '')) {
+        $errorMessage = 'Unable to sign in. Please try again.';
     } else {
         try {
-            $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true, 512, JSON_THROW_ON_ERROR);
-            $projectId = (string) ($serviceAccount['project_id'] ?? '');
-            $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
-            $privateKey = (string) ($serviceAccount['private_key'] ?? '');
-
-            if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
-                throw new RuntimeException('Invalid service account JSON.');
-            }
-
-            $token = getAccessToken($clientEmail, $privateKey);
-            $admin = fetchAdminByUsername($projectId, $token, $usernameInput);
+            $admin = $authMode === 'api'
+                ? fetchAdminByUsernameWithApiKey($projectId, $apiKey, $usernameInput)
+                : fetchAdminByUsername($projectId, $token, $usernameInput);
             if (!$admin || ($admin['password'] ?? '') !== $passwordInput) {
                 $errorMessage = 'Invalid username or password.';
             } else {
@@ -90,6 +115,17 @@ function fetchAdminByUsername(string $projectId, string $token, string $username
     return null;
 }
 
+function fetchAdminByUsernameWithApiKey(string $projectId, string $apiKey, string $username): ?array
+{
+    $admins = fetchAdminsWithApiKey($projectId, $apiKey);
+    foreach ($admins as $admin) {
+        if (strcasecmp($admin['username'] ?? '', $username) === 0) {
+            return $admin;
+        }
+    }
+    return null;
+}
+
 function resolveCredentialsPath(): string
 {
     $candidates = [
@@ -103,6 +139,71 @@ function resolveCredentialsPath(): string
         }
     }
     return '';
+}
+
+function resolveFirebaseConfig(): array
+{
+    $candidates = [
+        dirname(__DIR__) . '/firebase.json',
+        __DIR__ . '/firebase.json',
+        getcwd() . '/firebase.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            $config = json_decode((string) file_get_contents($path), true);
+            if (is_array($config)) {
+                return [
+                    'projectId' => (string) ($config['projectId'] ?? ''),
+                    'apiKey' => (string) ($config['apiKey'] ?? ''),
+                ];
+            }
+        }
+    }
+    return ['projectId' => '', 'apiKey' => ''];
+}
+
+function appendApiKey(string $url, string $apiKey): string
+{
+    $separator = strpos($url, '?') === false ? '?' : '&';
+    return $url . $separator . 'key=' . rawurlencode($apiKey);
+}
+
+function fetchAdminsWithApiKey(string $projectId, string $apiKey): array
+{
+    $admins = [];
+    $pageToken = '';
+    $pageSize = 200;
+    for ($page = 0; $page < 5; $page++) {
+        $query = http_build_query(array_filter([
+            'pageSize' => (string) $pageSize,
+            'pageToken' => $pageToken !== '' ? $pageToken : null,
+        ]));
+        $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+            . '/databases/(default)/documents/admins' . ($query !== '' ? '?' . $query : '');
+        $url = appendApiKey($url, $apiKey);
+        $response = curlJsonNoAuth('GET', $url, []);
+        $documents = $response['documents'] ?? [];
+        foreach ($documents as $doc) {
+            if (empty($doc['fields']) || empty($doc['name'])) {
+                continue;
+            }
+            $fields = $doc['fields'];
+            $admins[] = [
+                'id' => getFieldString($fields, 'id'),
+                'username' => getFieldString($fields, 'username'),
+                'password' => getFieldString($fields, 'password'),
+                'centerId' => getFieldString($fields, 'centerId'),
+                'centerCode' => getFieldString($fields, 'centerCode'),
+                'centerName' => getFieldString($fields, 'centerName'),
+                'centerType' => getFieldString($fields, 'centerType'),
+            ];
+        }
+        $pageToken = (string) ($response['nextPageToken'] ?? '');
+        if ($pageToken === '') {
+            break;
+        }
+    }
+    return $admins;
 }
 
 function getAccessToken(string $clientEmail, string $privateKey): string
@@ -186,6 +287,36 @@ function curlJson(string $method, string $url, string $token, array $payload): a
     return $data;
 }
 
+function curlJsonNoAuth(string $method, string $url, array $payload): array
+{
+    $ch = curl_init($url);
+    $options = [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+        ],
+        CURLOPT_TIMEOUT => 20,
+    ];
+    if (!empty($payload)) {
+        $options[CURLOPT_POSTFIELDS] = json_encode($payload);
+    }
+    curl_setopt_array($ch, $options);
+
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        throw new RuntimeException('Request failed: ' . curl_error($ch));
+    }
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || $status >= 400) {
+        throw new RuntimeException('Firestore API error: ' . $raw);
+    }
+
+    return $data;
+}
 function curlForm(string $method, string $url, array $fields): array
 {
     $ch = curl_init($url);

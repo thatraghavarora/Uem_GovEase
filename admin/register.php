@@ -2,6 +2,10 @@
 declare(strict_types=1);
 
 $credentialsPath = resolveCredentialsPath();
+$projectId = '';
+$token = '';
+$apiKey = '';
+$authMode = 'service';
 $errorMessage = '';
 $successMessage = '';
 
@@ -14,6 +18,35 @@ $form = [
     'centerType' => '',
 ];
 
+if ($credentialsPath !== '') {
+    try {
+        $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true);
+        $projectId = (string) ($serviceAccount['project_id'] ?? '');
+        $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
+        $privateKey = (string) ($serviceAccount['private_key'] ?? '');
+
+        if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
+            throw new RuntimeException('Invalid service account JSON.');
+        }
+
+        try {
+            $token = getAccessToken($clientEmail, $privateKey);
+        } catch (Throwable $e) {
+            $authMode = 'api';
+        }
+    } catch (Throwable $e) {
+        $authMode = 'api';
+    }
+} else {
+    $authMode = 'api';
+}
+
+if ($authMode === 'api') {
+    $config = resolveFirebaseConfig();
+    $projectId = $config['projectId'];
+    $apiKey = $config['apiKey'];
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     foreach ($form as $key => $value) {
         $form[$key] = trim((string) ($_POST[$key] ?? ''));
@@ -21,23 +54,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($form['username'] === '' || $form['password'] === '' || $form['centerId'] === '') {
         $errorMessage = 'Username, password, and centerId are required.';
-    } elseif ($credentialsPath === '') {
-        $errorMessage = 'Service account JSON not readable.';
+    } elseif ($authMode === 'api' && ($projectId === '' || $apiKey === '')) {
+        $errorMessage = 'Unable to register admin.';
     } else {
         try {
-            $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true, 512, JSON_THROW_ON_ERROR);
-            $projectId = (string) ($serviceAccount['project_id'] ?? '');
-            $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
-            $privateKey = (string) ($serviceAccount['private_key'] ?? '');
-
-            if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
-                throw new RuntimeException('Invalid service account JSON.');
-            }
-
-            $token = getAccessToken($clientEmail, $privateKey);
             $docId = 'admin-' . preg_replace('/[^a-zA-Z0-9_-]/', '-', $form['username']);
             $createdAt = gmdate('c');
-            createAdmin($projectId, $token, $docId, $form, $createdAt);
+            if ($authMode === 'api') {
+                createAdminWithApiKey($projectId, $apiKey, $docId, $form, $createdAt);
+            } else {
+                createAdmin($projectId, $token, $docId, $form, $createdAt);
+            }
             $successMessage = 'Admin registered successfully.';
         } catch (Throwable $e) {
             error_log('Admin register failed: ' . $e->getMessage());
@@ -61,6 +88,33 @@ function resolveCredentialsPath(): string
     return '';
 }
 
+function resolveFirebaseConfig(): array
+{
+    $candidates = [
+        dirname(__DIR__) . '/firebase.json',
+        __DIR__ . '/firebase.json',
+        getcwd() . '/firebase.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            $config = json_decode((string) file_get_contents($path), true);
+            if (is_array($config)) {
+                return [
+                    'projectId' => (string) ($config['projectId'] ?? ''),
+                    'apiKey' => (string) ($config['apiKey'] ?? ''),
+                ];
+            }
+        }
+    }
+    return ['projectId' => '', 'apiKey' => ''];
+}
+
+function appendApiKey(string $url, string $apiKey): string
+{
+    $separator = strpos($url, '?') === false ? '?' : '&';
+    return $url . $separator . 'key=' . rawurlencode($apiKey);
+}
+
 function createAdmin(string $projectId, string $token, string $docId, array $form, string $createdAt): void
 {
     $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
@@ -78,6 +132,26 @@ function createAdmin(string $projectId, string $token, string $docId, array $for
         ],
     ];
     curlJson('PATCH', $url, $token, $payload);
+}
+
+function createAdminWithApiKey(string $projectId, string $apiKey, string $docId, array $form, string $createdAt): void
+{
+    $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/admins/' . rawurlencode($docId);
+    $url = appendApiKey($url, $apiKey);
+    $payload = [
+        'fields' => [
+            'id' => ['stringValue' => $docId],
+            'username' => ['stringValue' => $form['username']],
+            'password' => ['stringValue' => $form['password']],
+            'centerId' => ['stringValue' => $form['centerId']],
+            'centerCode' => ['stringValue' => $form['centerCode']],
+            'centerName' => ['stringValue' => $form['centerName']],
+            'centerType' => ['stringValue' => $form['centerType']],
+            'createdAt' => ['timestampValue' => $createdAt],
+        ],
+    ];
+    curlJsonNoAuth('PATCH', $url, $payload);
 }
 
 function getAccessToken(string $clientEmail, string $privateKey): string
@@ -140,6 +214,36 @@ function curlJson(string $method, string $url, string $token, array $payload): a
     return $data;
 }
 
+function curlJsonNoAuth(string $method, string $url, array $payload): array
+{
+    $ch = curl_init($url);
+    $options = [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+        ],
+        CURLOPT_TIMEOUT => 20,
+    ];
+    if (!empty($payload)) {
+        $options[CURLOPT_POSTFIELDS] = json_encode($payload);
+    }
+    curl_setopt_array($ch, $options);
+
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        throw new RuntimeException('Request failed: ' . curl_error($ch));
+    }
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || $status >= 400) {
+        throw new RuntimeException('Firestore API error: ' . $raw);
+    }
+
+    return $data;
+}
 function curlForm(string $method, string $url, array $fields): array
 {
     $ch = curl_init($url);
