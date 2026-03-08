@@ -3,7 +3,12 @@ declare(strict_types=1);
 
 header('Content-Type: text/plain; charset=UTF-8');
 
-require __DIR__ . '/knowledge.php';
+if (is_readable(__DIR__ . '/knowledge.php')) {
+    require __DIR__ . '/knowledge.php';
+}
+if (!isset($knowledge) || !is_array($knowledge)) {
+    $knowledge = [];
+}
 
 $message = trim((string) ($_POST['message'] ?? ''));
 if ($message === '') {
@@ -32,7 +37,10 @@ $prompt = "You are GovEase AI Assistant.\n\n"
     . "respond conversationally in a friendly way.\n";
 
 $apiKey = getenv('GEMINI_API_KEY') ?: 'AIzaSyDWhh11Yxf5rB4QWMvUvwS2Ry9FXQ5JZ8k';
-$reply = fetchGeminiResponse($apiKey, $prompt);
+$reply = '';
+if (function_exists('curl_init')) {
+    $reply = fetchGeminiResponse($apiKey, $prompt);
+}
 
 if ($reply === '') {
     $reply = buildLocalAnswer($message, $context);
@@ -42,7 +50,7 @@ echo $reply;
 
 function fetchGeminiResponse(string $apiKey, string $prompt): string
 {
-    if ($apiKey === '') {
+    if ($apiKey === '' || !function_exists('curl_init')) {
         return '';
     }
 

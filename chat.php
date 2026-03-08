@@ -16,12 +16,15 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
   <link rel="stylesheet" href="style.css">
   <style>
     .page-wrapper {
-      padding-top: 2rem;
+      padding-top: 1rem;
       padding-bottom: 80px;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
     }
 
     .page-header {
-      padding: 0 1.25rem 1.25rem;
+      padding: 0 1.25rem 0.75rem;
     }
 
     .page-header h1 {
@@ -39,16 +42,22 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
       border: 1px solid var(--border-color);
       border-radius: var(--radius-lg);
       padding: 1.25rem;
-      margin: 0 1.25rem 1rem;
+      margin: 0 1.25rem 0.5rem;
       background-color: var(--white);
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
     }
 
     .chat-thread {
       display: grid;
       gap: 0.75rem;
-      max-height: 52vh;
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
       padding-right: 0.25rem;
+      padding-bottom: 0.5rem;
     }
 
     .chat-bubble {
@@ -56,7 +65,8 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
       border-radius: 0.9rem;
       font-size: 0.9rem;
       line-height: 1.4;
-      max-width: 80%;
+      max-width: 86%;
+      word-wrap: break-word;
     }
 
     .chat-bubble.assistant {
@@ -74,7 +84,10 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
     .chat-input {
       display: flex;
       gap: 0.5rem;
-      margin-top: 1rem;
+      margin-top: auto;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--border-color);
+      background: var(--white);
     }
 
     .chat-input input {
@@ -83,6 +96,7 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
       border-radius: var(--radius-md);
       border: 1px solid var(--border-color);
       background: #f8fafc;
+      outline: none;
     }
 
     .chat-input button {
@@ -92,6 +106,17 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
       padding: 0.7rem 1rem;
       border-radius: var(--radius-md);
       font-weight: 600;
+    }
+
+    .chat-input button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+
+    .chat-status {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      margin-top: 0.25rem;
     }
   </style>
 </head>
@@ -104,7 +129,7 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
     </div>
 
     <div class="chat-card">
-      <div class="chat-thread">
+      <div class="chat-thread" aria-live="polite">
         <div class="chat-bubble assistant">Hi! I can help you with bookings, tokens, and center details.</div>
         <div class="chat-bubble user">Show my latest token status.</div>
         <div class="chat-bubble assistant">Here’s a summary template. Connect this UI to your backend when ready.</div>
@@ -113,6 +138,7 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
         <input type="text" placeholder="Type your question...">
         <button type="button">Send</button>
       </div>
+      <div class="chat-status">Tip: Ask about appointments, tokens, or centers.</div>
     </div>
 
     <div class="bottom-nav">
@@ -193,18 +219,24 @@ if (empty($_COOKIE['user_phone']) || empty($_COOKIE['session_token'])) {
         addMessage(message, "user");
 
         input.value = "";
+        button.disabled = true;
 
         const formData = new FormData();
         formData.append("message", message);
 
-        const res = await fetch("chatbot_api.php", {
-          method: "POST",
-          body: formData
-        });
-
-        const reply = await res.text();
-
-        addMessage(reply, "assistant");
+        try {
+          const res = await fetch("chatbot_api.php", {
+            method: "POST",
+            body: formData
+          });
+          const reply = await res.text();
+          addMessage(reply, "assistant");
+        } catch (err) {
+          addMessage("Sorry, I couldn't fetch a response right now.", "assistant");
+        } finally {
+          button.disabled = false;
+          input.focus();
+        }
 
       }
 
