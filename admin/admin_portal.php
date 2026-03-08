@@ -13,6 +13,10 @@ $debug = isset($_GET['debug']) && $_GET['debug'] === '1';
 $errorMessage = '';
 $successMessage = '';
 $tokens = [];
+$projectId = '';
+$token = '';
+$apiKey = '';
+$authMode = 'service';
 
 $adminUser = (string) ($_SESSION['admin_user'] ?? '');
 $centerId = (string) ($_SESSION['admin_center_id'] ?? '');
@@ -25,37 +29,66 @@ if ($centerId === '' && $centerCode !== '') {
 
 if ($centerId === '') {
   $errorMessage = 'Center is not assigned to this admin.';
-} elseif ($credentialsPath === '') {
-  $errorMessage = 'Service account JSON not readable.';
 } else {
-  try {
-    $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true, 512, JSON_THROW_ON_ERROR);
-    $projectId = (string) ($serviceAccount['project_id'] ?? '');
-    $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
-    $privateKey = (string) ($serviceAccount['private_key'] ?? '');
+  if ($credentialsPath !== '') {
+    try {
+      $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true);
+      $projectId = (string) ($serviceAccount['project_id'] ?? '');
+      $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
+      $privateKey = (string) ($serviceAccount['private_key'] ?? '');
 
-    if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
-      throw new RuntimeException('Invalid service account JSON.');
-    }
-
-    $token = getAccessToken($clientEmail, $privateKey);
-
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-      $tokenId = trim((string) ($_POST['token_id'] ?? ''));
-      $action = trim((string) ($_POST['action'] ?? ''));
-      if ($tokenId !== '' && in_array($action, ['approve', 'decline'], true)) {
-        updateTokenStatus($projectId, $token, $tokenId, $adminUser, $action);
-        $successMessage = $action === 'approve' ? 'Token approved.' : 'Token declined.';
+      if ($projectId === '' || $clientEmail === '' || $privateKey === '') {
+        throw new RuntimeException('Invalid service account JSON.');
       }
-    }
 
-    $tokens = fetchTokensByListing($projectId, $token, $centerId, true);
-    if (empty($tokens)) {
-      $tokens = fetchTokensByListing($projectId, $token, $centerId, false);
+      try {
+        $token = getAccessToken($clientEmail, $privateKey);
+      } catch (Throwable $e) {
+        $authMode = 'api';
+      }
+    } catch (Throwable $e) {
+      $authMode = 'api';
     }
-  } catch (Throwable $e) {
-    error_log('Admin portal failed: ' . $e->getMessage());
-    $errorMessage = $debug ? ('Unable to load tokens: ' . $e->getMessage()) : 'Unable to load tokens.';
+  } else {
+    $authMode = 'api';
+  }
+
+  if ($authMode === 'api') {
+    $config = resolveFirebaseConfig();
+    $projectId = $config['projectId'];
+    $apiKey = $config['apiKey'];
+    if ($projectId === '' || $apiKey === '') {
+      $errorMessage = 'Unable to load tokens.';
+    }
+  }
+
+  if ($errorMessage === '') {
+    try {
+      if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $tokenId = trim((string) ($_POST['token_id'] ?? ''));
+        $action = trim((string) ($_POST['action'] ?? ''));
+        if ($tokenId !== '' && in_array($action, ['approve', 'decline'], true)) {
+          if ($authMode === 'api') {
+            updateTokenStatusWithApiKey($projectId, $apiKey, $tokenId, $adminUser, $action);
+          } else {
+            updateTokenStatus($projectId, $token, $tokenId, $adminUser, $action);
+          }
+          $successMessage = $action === 'approve' ? 'Token approved.' : 'Token declined.';
+        }
+      }
+
+      $tokens = $authMode === 'api'
+        ? fetchTokensByListingWithApiKey($projectId, $apiKey, $centerId, true)
+        : fetchTokensByListing($projectId, $token, $centerId, true);
+      if (empty($tokens)) {
+        $tokens = $authMode === 'api'
+          ? fetchTokensByListingWithApiKey($projectId, $apiKey, $centerId, false)
+          : fetchTokensByListing($projectId, $token, $centerId, false);
+      }
+    } catch (Throwable $e) {
+      error_log('Admin portal failed: ' . $e->getMessage());
+      $errorMessage = $debug ? ('Unable to load tokens: ' . $e->getMessage()) : 'Unable to load tokens.';
+    }
   }
 }
 
@@ -74,6 +107,33 @@ function resolveCredentialsPath(): string
   return '';
 }
 
+function resolveFirebaseConfig(): array
+{
+  $candidates = [
+    dirname(__DIR__) . '/firebase.json',
+    __DIR__ . '/firebase.json',
+    getcwd() . '/firebase.json',
+  ];
+  foreach ($candidates as $path) {
+    if ($path !== false && is_readable($path)) {
+      $config = json_decode((string) file_get_contents($path), true);
+      if (is_array($config)) {
+        return [
+          'projectId' => (string) ($config['projectId'] ?? ''),
+          'apiKey' => (string) ($config['apiKey'] ?? ''),
+        ];
+      }
+    }
+  }
+  return ['projectId' => '', 'apiKey' => ''];
+}
+
+function appendApiKey(string $url, string $apiKey): string
+{
+  $separator = strpos($url, '?') === false ? '?' : '&';
+  return $url . $separator . 'key=' . rawurlencode($apiKey);
+}
+
 function fetchTokensByListing(string $projectId, string $token, string $centerId, bool $activeOnly): array
 {
   $pageToken = '';
@@ -87,6 +147,57 @@ function fetchTokensByListing(string $projectId, string $token, string $centerId
     $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
       . '/databases/(default)/documents/token' . ($query !== '' ? '?' . $query : '');
     $response = curlJson('GET', $url, $token, []);
+    $documents = $response['documents'] ?? [];
+    foreach ($documents as $doc) {
+      if (empty($doc['fields']) || empty($doc['name'])) {
+        continue;
+      }
+      $fields = $doc['fields'];
+      $docCenterId = getFieldString($fields, 'centerId');
+      if ($docCenterId !== $centerId) {
+        continue;
+      }
+      $status = getFieldString($fields, 'status');
+      if ($activeOnly && $status !== 'active') {
+        continue;
+      }
+      $tokens[] = [
+        'id' => basename((string) $doc['name']),
+        'tokenNumber' => getFieldString($fields, 'tokenNumber'),
+        'userPhone' => getFieldString($fields, 'userPhone'),
+        'userName' => getFieldString($fields, 'userName'),
+        'appointmentTime' => getFieldString($fields, 'appointmentTime'),
+        'createdAt' => getFieldString($fields, 'createdAt'),
+        'status' => $status,
+      ];
+    }
+    $pageToken = (string) ($response['nextPageToken'] ?? '');
+    if ($pageToken === '') {
+      break;
+    }
+  }
+
+  usort($tokens, static function (array $a, array $b): int {
+    return strcmp($a['createdAt'], $b['createdAt']);
+  });
+
+  return $tokens;
+}
+
+function fetchTokensByListingWithApiKey(string $projectId, string $apiKey, string $centerId, bool $activeOnly): array
+{
+  $pageToken = '';
+  $tokens = [];
+  $pageSize = 200;
+  for ($page = 0; $page < 5; $page++) {
+    $query = http_build_query(array_filter([
+      'pageSize' => (string) $pageSize,
+      'pageToken' => $pageToken !== '' ? $pageToken : null,
+    ]));
+    $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+      . '/databases/(default)/documents/token' . ($query !== '' ? '?' . $query : '');
+    $url = appendApiKey($url, $apiKey);
+    $response = curlJsonNoAuth('GET', $url, []);
     $documents = $response['documents'] ?? [];
     foreach ($documents as $doc) {
       if (empty($doc['fields']) || empty($doc['name'])) {
@@ -141,6 +252,26 @@ function updateTokenStatus(string $projectId, string $token, string $tokenId, st
         ],
     ];
     curlJson('PATCH', $url, $token, $payload);
+}
+
+function updateTokenStatusWithApiKey(string $projectId, string $apiKey, string $tokenId, string $adminUser, string $action): void
+{
+    $statusValue = $action === 'approve' ? 'approved' : 'declined';
+    $byField = $action === 'approve' ? 'approvedBy' : 'declinedBy';
+    $atField = $action === 'approve' ? 'approvedAt' : 'declinedAt';
+    $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/token/' . rawurlencode($tokenId)
+        . '?updateMask.fieldPaths=status&updateMask.fieldPaths=' . rawurlencode($byField)
+        . '&updateMask.fieldPaths=' . rawurlencode($atField);
+    $url = appendApiKey($url, $apiKey);
+    $payload = [
+        'fields' => [
+            'status' => ['stringValue' => $statusValue],
+            $byField => ['stringValue' => $adminUser],
+            $atField => ['timestampValue' => gmdate('c')],
+        ],
+    ];
+    curlJsonNoAuth('PATCH', $url, $payload);
 }
 
 function getAccessToken(string $clientEmail, string $privateKey): string
@@ -201,6 +332,37 @@ function curlJson(string $method, string $url, string $token, array $payload): a
     CURLOPT_HTTPHEADER => [
       'Content-Type: application/json',
       'Authorization: Bearer ' . $token,
+    ],
+    CURLOPT_TIMEOUT => 20,
+  ];
+  if (!empty($payload)) {
+    $options[CURLOPT_POSTFIELDS] = json_encode($payload);
+  }
+  curl_setopt_array($ch, $options);
+
+  $raw = curl_exec($ch);
+  if ($raw === false) {
+    throw new RuntimeException('Request failed: ' . curl_error($ch));
+  }
+  $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+
+  $data = json_decode($raw, true);
+  if (!is_array($data) || $status >= 400) {
+    throw new RuntimeException('Firestore API error: ' . $raw);
+  }
+
+  return $data;
+}
+
+function curlJsonNoAuth(string $method, string $url, array $payload): array
+{
+  $ch = curl_init($url);
+  $options = [
+    CURLOPT_CUSTOMREQUEST => $method,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_HTTPHEADER => [
+      'Content-Type: application/json',
     ],
     CURLOPT_TIMEOUT => 20,
   ];
