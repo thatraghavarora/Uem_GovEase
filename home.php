@@ -147,6 +147,23 @@ if (is_readable($credentialsPath)) {
     $centersError = 'Service account JSON not readable.';
 }
 
+$fallbackConfig = resolveFirebaseConfig();
+if (empty($centers) && $fallbackConfig['projectId'] !== '' && $fallbackConfig['apiKey'] !== '') {
+    try {
+        $fallbackCenters = fetchCentersWithApiKey($fallbackConfig['projectId'], $fallbackConfig['apiKey']);
+        if (!empty($fallbackCenters)) {
+            $centers = $fallbackCenters;
+            $centersError = '';
+        } elseif ($centersError === '') {
+            $centersError = 'No centers found in the database.';
+        }
+    } catch (Throwable $e) {
+        if ($centersError === '') {
+            $centersError = 'Unable to fetch centers. Please try again later.';
+        }
+    }
+}
+
 $displayName = $kycDetails['fullName'] !== '' ? $kycDetails['fullName'] : $cookieName;
 $greetingName = $displayName !== '' ? $displayName : 'there';
 $displayPhone = $kycDetails['phone'];
@@ -357,6 +374,103 @@ function curlForm(string $method, string $url, array $fields): array
 function base64UrlEncode(string $data): string
 {
     return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function resolveFirebaseConfig(): array
+{
+    $candidates = [
+        __DIR__ . '/firebase.json',
+        dirname(__DIR__) . '/firebase.json',
+        getcwd() . '/firebase.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            $config = json_decode((string) file_get_contents($path), true);
+            if (is_array($config)) {
+                return [
+                    'projectId' => (string) ($config['projectId'] ?? ''),
+                    'apiKey' => (string) ($config['apiKey'] ?? ''),
+                ];
+            }
+        }
+    }
+    return ['projectId' => '', 'apiKey' => ''];
+}
+
+function fetchCentersWithApiKey(string $projectId, string $apiKey): array
+{
+    $centers = [];
+    $pageToken = '';
+    $pageSize = 200;
+    $maxPages = 5;
+
+    for ($page = 0; $page < $maxPages; $page++) {
+        $query = http_build_query(array_filter([
+            'pageSize' => (string) $pageSize,
+            'pageToken' => $pageToken !== '' ? $pageToken : null,
+            'key' => $apiKey,
+        ]));
+        $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+            . '/databases/(default)/documents/centers' . ($query !== '' ? '?' . $query : '');
+        $response = curlJsonNoAuth('GET', $url, []);
+
+        $documents = $response['documents'] ?? [];
+        foreach ($documents as $doc) {
+            if (empty($doc['fields']) || empty($doc['name'])) {
+                continue;
+            }
+            $fields = $doc['fields'];
+            $docPath = (string) $doc['name'];
+            $docId = basename($docPath);
+            $centers[] = [
+                'id' => $docId,
+                'path' => $docPath,
+                'name' => getFieldString($fields, 'name'),
+                'city' => getFieldString($fields, 'city'),
+                'address' => getFieldString($fields, 'address'),
+                'type' => getFieldString($fields, 'type'),
+                'phone' => getFieldString($fields, 'phone'),
+                'code' => getFieldString($fields, 'code'),
+                'location' => getFieldString($fields, 'location'),
+            ];
+        }
+
+        $pageToken = (string) ($response['nextPageToken'] ?? '');
+        if ($pageToken === '') {
+            break;
+        }
+    }
+
+    return $centers;
+}
+
+function curlJsonNoAuth(string $method, string $url, array $payload): array
+{
+    $ch = curl_init($url);
+    $options = [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT => 15,
+    ];
+    if (!empty($payload)) {
+        $options[CURLOPT_POSTFIELDS] = json_encode($payload);
+    }
+    curl_setopt_array($ch, $options);
+
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        throw new RuntimeException('Request failed: ' . curl_error($ch));
+    }
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || $status >= 400) {
+        throw new RuntimeException('Firestore API error: ' . $raw);
+    }
+
+    return $data;
 }
 ?>
 <!DOCTYPE html>

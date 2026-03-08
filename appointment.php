@@ -23,7 +23,11 @@ if ($centerId === '' && $centerPath !== '') {
     $centerId = basename($centerPath);
 }
 
-$credentialsPath = __DIR__ . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json';
+$credentialsPath = resolveCredentialsPath();
+$projectId = '';
+$token = '';
+$apiKey = '';
+$authMode = 'service';
 $center = null;
 $centerList = [];
 $userProfile = null;
@@ -31,11 +35,9 @@ $userTickets = [];
 $tokenInfo = null;
 $errorMessage = '';
 
-if (!is_readable($credentialsPath)) {
-    $errorMessage = 'Service account JSON not readable.';
-} else {
+if ($credentialsPath !== '') {
     try {
-        $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true, 512, JSON_THROW_ON_ERROR);
+        $serviceAccount = json_decode((string) file_get_contents($credentialsPath), true);
         $projectId = (string) ($serviceAccount['project_id'] ?? '');
         $clientEmail = (string) ($serviceAccount['client_email'] ?? '');
         $privateKey = (string) ($serviceAccount['private_key'] ?? '');
@@ -44,33 +46,64 @@ if (!is_readable($credentialsPath)) {
             throw new RuntimeException('Invalid service account JSON.');
         }
 
-        $token = getAccessToken($clientEmail, $privateKey);
+        try {
+            $token = getAccessToken($clientEmail, $privateKey);
+        } catch (Throwable $e) {
+            $authMode = 'api';
+        }
+    } catch (Throwable $e) {
+        $authMode = 'api';
+    }
+} else {
+    $authMode = 'api';
+}
+
+if ($authMode === 'api') {
+    $config = resolveFirebaseConfig();
+    $projectId = $config['projectId'];
+    $apiKey = $config['apiKey'];
+    if ($projectId === '' || $apiKey === '') {
+        $errorMessage = 'Unable to load appointment details.';
+    }
+}
+
+if ($errorMessage === '') {
+    try {
         if ($centerId === '' && $centerPath === '') {
-            $centerList = fetchCentersList($projectId, $token, 50);
+            $centerList = $authMode === 'api'
+                ? fetchCentersListWithApiKey($projectId, $apiKey, 50)
+                : fetchCentersList($projectId, $token, 50);
         } else {
-            $center = $centerPath !== '' ? fetchCenterByPath($projectId, $token, $centerPath) : fetchCenterById($projectId, $token, $centerId);
+            if ($authMode === 'api') {
+                $center = $centerPath !== ''
+                    ? fetchCenterByPathWithApiKey($projectId, $apiKey, $centerPath)
+                    : fetchCenterByIdWithApiKey($projectId, $apiKey, $centerId);
+            } else {
+                $center = $centerPath !== ''
+                    ? fetchCenterByPath($projectId, $token, $centerPath)
+                    : fetchCenterById($projectId, $token, $centerId);
+            }
 
             if ($_SERVER['REQUEST_METHOD'] === 'POST' && $center) {
                 $centerDocId = $center['id'] !== '' ? $center['id'] : $centerId;
-                $tokenInfo = createToken(
-                    $projectId,
-                    $token,
-                    $centerDocId,
-                    $userPhone,
-                    $userName,
-                    $userEmail,
-                    $requestedTime,
-                    $centerPath
-                );
+                $tokenInfo = $authMode === 'api'
+                    ? createTokenWithApiKey($projectId, $apiKey, $centerDocId, $userPhone, $userName, $userEmail, $requestedTime)
+                    : createToken($projectId, $token, $centerDocId, $userPhone, $userName, $userEmail, $requestedTime, $centerPath);
                 try {
-                    appendUserTicket($projectId, $token, $userPhone, $center, $tokenInfo, $requestedTime);
+                    if ($authMode === 'api') {
+                        appendUserTicketWithApiKey($projectId, $apiKey, $userPhone, $center, $tokenInfo, $requestedTime);
+                    } else {
+                        appendUserTicket($projectId, $token, $userPhone, $center, $tokenInfo, $requestedTime);
+                    }
                 } catch (Throwable $e) {
                     error_log('Ticket append failed: ' . $e->getMessage());
                 }
             }
         }
 
-        $userProfile = fetchUserProfile($projectId, $token, $userPhone);
+        $userProfile = $authMode === 'api'
+            ? fetchUserProfileWithApiKey($projectId, $apiKey, $userPhone)
+            : fetchUserProfile($projectId, $token, $userPhone);
         if ($userProfile && !empty($userProfile['tickets'])) {
             $userTickets = $userProfile['tickets'];
         }
@@ -601,6 +634,377 @@ function curlForm(string $method, string $url, array $fields): array
     }
 
     return $data;
+}
+
+function resolveCredentialsPath(): string
+{
+    $candidates = [
+        __DIR__ . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json',
+        dirname(__DIR__) . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json',
+        getcwd() . '/govease-99021-firebase-adminsdk-fbsvc-fe9d642385.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            return $path;
+        }
+    }
+    return '';
+}
+
+function resolveFirebaseConfig(): array
+{
+    $candidates = [
+        __DIR__ . '/firebase.json',
+        dirname(__DIR__) . '/firebase.json',
+        getcwd() . '/firebase.json',
+    ];
+    foreach ($candidates as $path) {
+        if ($path !== false && is_readable($path)) {
+            $config = json_decode((string) file_get_contents($path), true);
+            if (is_array($config)) {
+                return [
+                    'projectId' => (string) ($config['projectId'] ?? ''),
+                    'apiKey' => (string) ($config['apiKey'] ?? ''),
+                ];
+            }
+        }
+    }
+    return ['projectId' => '', 'apiKey' => ''];
+}
+
+function appendApiKey(string $url, string $apiKey): string
+{
+    $separator = strpos($url, '?') === false ? '?' : '&';
+    return $url . $separator . 'key=' . rawurlencode($apiKey);
+}
+
+function curlJsonNoAuth(string $method, string $url, array $payload): array
+{
+    $ch = curl_init($url);
+    $options = [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+        ],
+        CURLOPT_TIMEOUT => 20,
+    ];
+    if (!empty($payload)) {
+        $options[CURLOPT_POSTFIELDS] = json_encode($payload);
+    }
+    curl_setopt_array($ch, $options);
+
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        throw new RuntimeException('Request failed: ' . curl_error($ch));
+    }
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || $status >= 400) {
+        throw new RuntimeException('Firestore API error: ' . $raw);
+    }
+
+    return $data;
+}
+
+function fetchCentersListWithApiKey(string $projectId, string $apiKey, int $limit): array
+{
+    $centers = [];
+    $pageToken = '';
+    $pageSize = min($limit, 200);
+
+    while (count($centers) < $limit) {
+        $query = http_build_query(array_filter([
+            'pageSize' => (string) $pageSize,
+            'pageToken' => $pageToken !== '' ? $pageToken : null,
+        ]));
+        $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+            . '/databases/(default)/documents/centers' . ($query !== '' ? '?' . $query : '');
+        $url = appendApiKey($url, $apiKey);
+        $response = curlJsonNoAuth('GET', $url, []);
+
+        $documents = $response['documents'] ?? [];
+        foreach ($documents as $doc) {
+            if (empty($doc['fields']) || empty($doc['name'])) {
+                continue;
+            }
+            $fields = $doc['fields'];
+            $docPath = (string) $doc['name'];
+            $centers[] = [
+                'id' => basename($docPath),
+                'path' => $docPath,
+                'name' => getFieldString($fields, 'name'),
+                'city' => getFieldString($fields, 'city'),
+                'type' => getFieldString($fields, 'type'),
+            ];
+            if (count($centers) >= $limit) {
+                break;
+            }
+        }
+
+        $pageToken = (string) ($response['nextPageToken'] ?? '');
+        if ($pageToken === '') {
+            break;
+        }
+    }
+
+    return $centers;
+}
+
+function fetchCenterByIdWithApiKey(string $projectId, string $apiKey, string $centerId): ?array
+{
+    $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/centers/' . rawurlencode($centerId);
+    $url = appendApiKey($url, $apiKey);
+    $response = curlJsonNoAuth('GET', $url, []);
+    if (empty($response['fields'])) {
+        return null;
+    }
+    $fields = $response['fields'];
+    return [
+        'id' => $centerId,
+        'name' => getFieldString($fields, 'name'),
+        'address' => getFieldString($fields, 'address'),
+        'city' => getFieldString($fields, 'city'),
+        'type' => getFieldString($fields, 'type'),
+        'phone' => getFieldString($fields, 'phone'),
+        'fields' => normalizeFields($fields),
+    ];
+}
+
+function fetchCenterByPathWithApiKey(string $projectId, string $apiKey, string $centerPath): ?array
+{
+    $path = preg_replace('#^projects/[^/]+/databases/\\(default\\)/documents/#', '', $centerPath);
+    $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/' . ltrim($path, '/');
+    $url = appendApiKey($url, $apiKey);
+    $response = curlJsonNoAuth('GET', $url, []);
+
+    if (empty($response['fields'])) {
+        return null;
+    }
+
+    $fields = $response['fields'];
+    $docPath = (string) ($response['name'] ?? $centerPath);
+    return [
+        'id' => basename($docPath),
+        'name' => getFieldString($fields, 'name'),
+        'address' => getFieldString($fields, 'address'),
+        'city' => getFieldString($fields, 'city'),
+        'type' => getFieldString($fields, 'type'),
+        'phone' => getFieldString($fields, 'phone'),
+        'fields' => normalizeFields($fields),
+    ];
+}
+
+function fetchDocumentWithApiKey(string $url, string $apiKey): ?array
+{
+    $url = appendApiKey($url, $apiKey);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => 'GET',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT => 15,
+    ]);
+
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        throw new RuntimeException('Request failed: ' . curl_error($ch));
+    }
+    $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($status === 404) {
+        return null;
+    }
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || $status >= 400) {
+        throw new RuntimeException('Firestore API error: ' . $raw);
+    }
+
+    return $data;
+}
+
+function fetchUserProfileWithApiKey(string $projectId, string $apiKey, string $userPhone): ?array
+{
+    if ($userPhone === '') {
+        return null;
+    }
+
+    $docUrl = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/kyc_submissions/' . rawurlencode($userPhone);
+    $doc = fetchDocumentWithApiKey($docUrl, $apiKey);
+    if (!$doc || empty($doc['fields'])) {
+        return null;
+    }
+    $fields = $doc['fields'];
+    $tickets = [];
+    if (!empty($fields['tickets']['arrayValue']['values']) && is_array($fields['tickets']['arrayValue']['values'])) {
+        foreach ($fields['tickets']['arrayValue']['values'] as $value) {
+            if (!is_array($value) || empty($value['mapValue']['fields'])) {
+                continue;
+            }
+            $ticketFields = $value['mapValue']['fields'];
+            $tickets[] = [
+                'tokenId' => getFieldString($ticketFields, 'tokenId'),
+                'tokenNumber' => getFieldString($ticketFields, 'tokenNumber'),
+                'centerId' => getFieldString($ticketFields, 'centerId'),
+                'centerName' => getFieldString($ticketFields, 'centerName'),
+                'appointmentTime' => getFieldString($ticketFields, 'appointmentTime'),
+                'createdAt' => getFieldString($ticketFields, 'createdAt'),
+            ];
+        }
+    }
+
+    return [
+        'fullName' => getFieldString($fields, 'fullName'),
+        'name' => getFieldString($fields, 'name'),
+        'email' => getFieldString($fields, 'email'),
+        'phone' => getFieldString($fields, 'phone'),
+        'tickets' => $tickets,
+    ];
+}
+
+function getNextTokenNumberWithApiKey(string $projectId, string $apiKey, string $centerId): int
+{
+    $max = 0;
+    $pageToken = '';
+    $pageSize = 200;
+
+    for ($page = 0; $page < 5; $page++) {
+        $query = http_build_query(array_filter([
+            'pageSize' => (string) $pageSize,
+            'pageToken' => $pageToken !== '' ? $pageToken : null,
+        ]));
+        $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+            . '/databases/(default)/documents/token' . ($query !== '' ? '?' . $query : '');
+        $url = appendApiKey($url, $apiKey);
+        $response = curlJsonNoAuth('GET', $url, []);
+        $documents = $response['documents'] ?? [];
+        foreach ($documents as $doc) {
+            if (empty($doc['fields'])) {
+                continue;
+            }
+            $fields = $doc['fields'];
+            if (getFieldString($fields, 'centerId') !== $centerId) {
+                continue;
+            }
+            $tokenNumber = getFieldString($fields, 'tokenNumber');
+            if ($tokenNumber !== '' && ctype_digit($tokenNumber)) {
+                $number = (int) $tokenNumber;
+                if ($number > $max) {
+                    $max = $number;
+                }
+            }
+        }
+        $pageToken = (string) ($response['nextPageToken'] ?? '');
+        if ($pageToken === '') {
+            break;
+        }
+    }
+
+    return $max + 1;
+}
+
+function createTokenWithApiKey(
+    string $projectId,
+    string $apiKey,
+    string $centerId,
+    string $userPhone,
+    string $userName,
+    string $userEmail,
+    string $appointmentTime
+): array {
+    $tokenNumber = getNextTokenNumberWithApiKey($projectId, $apiKey, $centerId);
+    $createdAt = gmdate('c');
+    $tokenDocId = $centerId . '-' . $tokenNumber . '-' . gmdate('His');
+
+    $payload = [
+        'fields' => [
+            'centerId' => ['stringValue' => $centerId],
+            'userPhone' => ['stringValue' => $userPhone],
+            'userName' => ['stringValue' => $userName],
+            'userEmail' => ['stringValue' => $userEmail],
+            'tokenNumber' => ['integerValue' => (string) $tokenNumber],
+            'status' => ['stringValue' => 'active'],
+            'createdAt' => ['timestampValue' => $createdAt],
+            'appointmentTime' => ['stringValue' => $appointmentTime],
+        ],
+    ];
+
+    $url = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/token/' . rawurlencode($tokenDocId);
+    $url = appendApiKey($url, $apiKey);
+    $response = curlJsonNoAuth('PATCH', $url, $payload);
+    if (empty($response['name'])) {
+        throw new RuntimeException('Token creation failed.');
+    }
+
+    return [
+        'id' => $tokenDocId,
+        'number' => $tokenNumber,
+        'createdAt' => $createdAt,
+        'appointmentTime' => $appointmentTime,
+    ];
+}
+
+function appendUserTicketWithApiKey(
+    string $projectId,
+    string $apiKey,
+    string $userPhone,
+    array $center,
+    array $tokenInfo,
+    string $appointmentTime
+): void {
+    $docId = $userPhone;
+    $docUrl = 'https://firestore.googleapis.com/v1/projects/' . rawurlencode($projectId)
+        . '/databases/(default)/documents/kyc_submissions/' . rawurlencode($docId);
+    $existing = fetchDocumentWithApiKey($docUrl, $apiKey);
+    $existingValues = [];
+
+    if ($existing && !empty($existing['fields']['tickets']['arrayValue']['values'])) {
+        $values = $existing['fields']['tickets']['arrayValue']['values'];
+        if (is_array($values)) {
+            $existingValues = $values;
+        }
+    }
+
+    $newTicket = [
+        'mapValue' => [
+            'fields' => [
+                'tokenId' => ['stringValue' => (string) $tokenInfo['id']],
+                'tokenNumber' => ['integerValue' => (string) $tokenInfo['number']],
+                'centerId' => ['stringValue' => (string) ($center['id'] ?? '')],
+                'centerName' => ['stringValue' => (string) ($center['name'] ?? '')],
+                'appointmentTime' => ['stringValue' => $appointmentTime],
+                'createdAt' => ['timestampValue' => (string) $tokenInfo['createdAt']],
+            ],
+        ],
+    ];
+
+    $payload = [
+        'fields' => [
+            'phone' => ['stringValue' => $userPhone],
+            'tickets' => [
+                'arrayValue' => [
+                    'values' => array_values(array_merge($existingValues, [$newTicket])),
+                ],
+            ],
+        ],
+    ];
+
+    if ($existing === null) {
+        $url = appendApiKey($docUrl, $apiKey);
+        curlJsonNoAuth('PATCH', $url, $payload);
+    } else {
+        $updateUrl = $docUrl . '?updateMask.fieldPaths=tickets&updateMask.fieldPaths=phone';
+        $updateUrl = appendApiKey($updateUrl, $apiKey);
+        curlJsonNoAuth('PATCH', $updateUrl, $payload);
+    }
 }
 
 function base64UrlEncode(string $data): string

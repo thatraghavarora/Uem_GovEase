@@ -267,9 +267,14 @@ $hasEmail = $userEmail !== '';
                 <div class="field">
                     <label class="label" for="phone">Mobile Number<span>*</span></label>
                     <div class="input-wrapper">
-                        <input class="input input-locked" id="phone" name="phone_display" placeholder="Enter your mobile number"
-                            value="<?php echo htmlspecialchars($userPhone); ?>" readonly>
-                        <input type="hidden" name="phone" id="phoneHidden" value="<?php echo htmlspecialchars($userPhone); ?>">
+                        <input class="input<?php echo $hasPhone ? ' input-locked' : ''; ?>" id="phone"
+                            name="<?php echo $hasPhone ? 'phone_display' : 'phone'; ?>"
+                            placeholder="Enter your mobile number"
+                            value="<?php echo htmlspecialchars($userPhone); ?>"
+                            <?php echo $hasPhone ? 'readonly' : 'required'; ?>>
+                        <?php if ($hasPhone): ?>
+                            <input type="hidden" name="phone" id="phoneHidden" value="<?php echo htmlspecialchars($userPhone); ?>">
+                        <?php endif; ?>
                     </div>
                     <div class="help">Use the same number as your login.</div>
                 </div>
